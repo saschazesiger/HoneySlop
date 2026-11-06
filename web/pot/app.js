@@ -49,6 +49,10 @@
     back: '<path d="M19 12H5M11 18l-6-6 6-6"/>',
     bolt: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
     crosshair: '<circle cx="12" cy="12" r="8"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="1.2"/>',
+    key: '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8M17 6l3 3M14.5 8.5l2.5 2.5"/>',
+    eye: '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    eyeoff: '<path d="M10.6 5.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-2.9 3.9M6.6 6.6C3.7 8.5 2 12 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18"/>',
+    refresh: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>',
   };
   function icon(name, cls) {
     const s = document.createElement('span');
@@ -90,9 +94,54 @@
     if (ms < 1000) return Math.round(ms) + 'ms';
     return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + 's';
   }
-  function fmtNum(n) { return n == null ? '–' : Number(n).toLocaleString('en-US'); }
+  function fmtNum(n) { return n == null || n === '' || isNaN(n) ? '–' : Number(n).toLocaleString('en-US'); }
   function fmtBytes(n) { return n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB'; }
   function plural(n, one, many) { return fmtNum(n) + ' ' + (n === 1 ? one : (many || one + 's')); }
+
+  /* ------------------------------------------------------------------ attack progress */
+
+  // Kill-chain milestones in order. Keys come from the backend (ip.milestones, event.flags, stats.milestones).
+  const MILESTONES = [
+    { k: 'creds', label: 'creds', short: 'C', desc: 'real secrets', title: 'Obtained real secrets' },
+    { k: 'db', label: 'db', short: 'D', desc: 'database access', title: 'Got database access' },
+    { k: 'login', label: 'login', short: 'L', desc: 'web app login', title: 'Logged into a web app with real credentials' },
+    { k: 'user', label: 'user', short: 'U', desc: 'shell as deploy', title: 'Lateral movement: shell as user deploy' },
+    { k: 'root', label: 'root', short: 'R', desc: 'root shell', title: 'Root shell' },
+  ];
+  const MS_BY_KEY = Object.fromEntries(MILESTONES.map((m) => [m.k, m]));
+
+  /** "creds,db" | ["creds"] | null → ordered array of normalized keys (unknown keys kept at the end). */
+  function msList(v) {
+    const raw = Array.isArray(v) ? v : str(v).split(',');
+    const set = new Set(raw.map((x) => str(x).trim().toLowerCase()).filter((x) => /^[a-z0-9_-]{1,24}$/.test(x)));
+    return [...MILESTONES.map((m) => m.k).filter((k) => set.has(k)), ...[...set].filter((k) => !MS_BY_KEY[k])];
+  }
+  function msUnion(a, b) { return msList([...msList(a), ...msList(b)]).join(','); }
+
+  function flagBadge(k) {
+    const m = MS_BY_KEY[k];
+    return h('span', { class: 'fl f-' + k.replace(/[^a-z0-9]/g, ''), text: k.toUpperCase(), title: 'Milestone reached: ' + (m ? m.title : k) });
+  }
+
+  /* terminal prompts */
+
+  const homeOf = (u) => (u === 'root' ? '/root' : u === 'www-data' ? '/var/www' : u ? '/home/' + u : '');
+  function shortCwd(cwd, user) {
+    const p = str(cwd), hm = homeOf(user);
+    if (!p) return '~';
+    if (hm && p === hm) return '~';
+    if (hm && p.startsWith(hm + '/')) return '~' + p.slice(hm.length);
+    return p;
+  }
+  /** shell | pw (hidden password input) | sql (mysql monitor) | other */
+  function promptKind(ev) {
+    const t = str(ev.prompt).trim();
+    if (!t) return 'shell';
+    if (/^(mysql|mariadb|MariaDB \[[^\]]*\])>$/i.test(t) || t === '->') return 'sql';
+    if (/pass(word|phrase)/i.test(t)) return 'pw';
+    return 'other';
+  }
+  function termHost(ev) { return str(ev.term_host) || (S.world && str(S.world.hostname)) || ''; }
 
   /** Element whose text is a relative time that the global ticker keeps fresh. */
   function relEl(tag, cls, ts) {
@@ -223,6 +272,7 @@
     esResync: false,
     statsTimer: null,
     statsSoon: null,
+    world: null,          // GET /world (hostname for prompts, World tab)
   };
 
   /* ------------------------------------------------------------------ auth screens */
@@ -324,6 +374,7 @@
       loadSettings().catch(reportError),
       loadStats().catch(reportError),
       loadIPs().catch(reportError),
+      loadWorld().catch(() => {}), // optional: older backends have no /world
     ]);
     if (!S.authed) return;
     const fromHash = ipFromHash();
@@ -452,10 +503,30 @@
     set('st-ai24', st.ai_calls_24h, prev && prev.ai_calls_24h);
     set('st-term24', st.terminal_cmds_24h, prev && prev.terminal_cmds_24h);
     set('st-total', st.events_total, prev && prev.events_total);
+    renderChainStats(st.milestones);
     if (S.settings && typeof st.ai_enabled === 'boolean' && st.ai_enabled !== S.settings.ai_enabled) {
       // Stats are fresher than our cached settings? re-fetch to stay consistent.
       loadSettings().catch(() => {});
     } else renderAI();
+  }
+
+  function renderChainStats(ms) {
+    const wrap = $('chain-stats');
+    const ok = ms && typeof ms === 'object' && !Array.isArray(ms);
+    wrap.hidden = !ok;
+    if (!ok) return;
+    const parts = [];
+    for (const el of wrap.querySelectorAll('.cs')) {
+      const k = el.dataset.k;
+      const n = Number(ms[k]) || 0;
+      const v = el.querySelector('.cs-v');
+      const t = fmtNum(n);
+      if (v.textContent !== t) v.textContent = t;
+      el.classList.toggle('on', n > 0);
+      el.title = (MS_BY_KEY[k] ? MS_BY_KEY[k].title : k) + ': ' + plural(n, 'attacker');
+      parts.push(k + ' ' + n);
+    }
+    wrap.setAttribute('aria-label', 'Attackers per stage: ' + parts.join(', '));
   }
 
   function statsSoon() {
@@ -555,8 +626,9 @@
     $('lim-domain').title = str(s.domain) || location.host;
   }
 
-  async function openSettings() {
+  async function openSettings(tab) {
     keyClear = false;
+    showSettingsTab(tab === 'world' ? 'world' : 'general');
     try { await loadSettings(); } catch (err) { reportError(err); if (!S.settings) return; }
     const s = S.settings;
     $('set-key').value = '';
@@ -569,7 +641,153 @@
     settingsError('');
     fillSettingsStatic();
     openModal('settings-modal');
-    setTimeout(() => $('set-model').focus(), 30);
+    if (tab !== 'world') setTimeout(() => $('set-model').focus(), 30);
+  }
+
+  function showSettingsTab(name) {
+    const world = name === 'world';
+    for (const t of document.querySelectorAll('#settings-modal .mtab')) {
+      const on = t.dataset.tab === name;
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', String(on));
+      t.tabIndex = on ? 0 : -1;
+    }
+    $('settings-form').hidden = world;
+    $('world-pane').hidden = !world;
+    $('settings-save').hidden = world;
+    $('settings-cancel').textContent = world ? 'Close' : 'Cancel';
+    if (world) { settingsError(''); loadWorld({ render: true }).catch(() => {}); }
+  }
+
+  /* world */
+
+  const KIND_LABEL = { unix: 'Unix accounts', mysql: 'MySQL', portal: 'Portal users', wordpress: 'WordPress', api: 'API keys and tokens' };
+  const KIND_ORDER = ['unix', 'mysql', 'portal', 'wordpress', 'api'];
+  let worldReq = null;
+
+  /** GET /world. Always caches (the hostname feeds terminal prompts); renders when the World tab asks. */
+  async function loadWorld(opts) {
+    const render = opts && opts.render;
+    if (render) { if (S.world) renderWorld(); else worldMsg('loading'); }
+    if (!worldReq) worldReq = api('GET', '/world').finally(() => { worldReq = null; });
+    try {
+      const w = await worldReq;
+      if (w && typeof w === 'object') S.world = w;
+      if (render) renderWorld();
+    } catch (err) {
+      if (render) worldMsg('err', err.status === 404 ? 'This server does not expose world data yet. Update HoneySlop to see the generated machine.' : 'Failed to load world: ' + err.message);
+      throw err;
+    }
+  }
+
+  function worldMsg(kind, text) {
+    const el = $('world-msg');
+    el.className = 'world-msg' + (kind === 'err' ? ' err' : '');
+    el.textContent = '';
+    if (kind === 'loading') el.append(h('span', { class: 'spin' }), 'Loading world…');
+    else if (text) el.append(text);
+    el.hidden = !kind;
+    const noData = kind === 'err' && !S.world;
+    $('world-chain-sec').hidden = kind === 'loading' || noData;
+    $('world-creds-sec').hidden = kind === 'loading' || noData;
+    $('world-regen').disabled = noData;
+  }
+
+  function renderWorld() {
+    const w = S.world;
+    if (!w) return;
+    worldMsg('');
+    $('world-host').textContent = str(w.hostname) || '–';
+    $('world-host').title = str(w.hostname);
+    $('world-ip').textContent = str(w.ip) || '–';
+    const created = Date.parse(str(w.created));
+    $('world-created').textContent = isNaN(created) ? '–' : fmtFull(created);
+    $('world-created').title = isNaN(created) ? '' : new Date(created).toString() + ' (' + fmtRel(created) + ')';
+
+    const chain = $('world-chain');
+    chain.textContent = '';
+    const steps = Array.isArray(w.chain) ? w.chain.filter((c) => c && (c.step || c.detail)) : [];
+    steps.forEach((c, i) => {
+      // step is often a milestone key (creds/db/login/user/root); show its label + a chip when so.
+      const m = MS_BY_KEY[str(c.step).trim().toLowerCase()];
+      chain.append(h('li', { class: 'wc' + (m ? ' wc-ms' : '') },
+        h('span', { class: 'wc-n', text: pad(i + 1) }),
+        h('span', { class: 'wc-s' }, m ? [h('span', { class: 'fl f-' + m.k, text: m.label.toUpperCase() }), h('span', { class: 'wc-st', text: m.desc })] : str(c.step)),
+        c.detail ? h('span', { class: 'wc-d', text: str(c.detail) }) : null));
+    });
+    if (!steps.length) chain.append(h('li', { class: 'tl-empty', text: 'No attack chain provided.' }));
+
+    const box = $('world-secrets');
+    box.textContent = '';
+    const groups = new Map();
+    for (const sec of Array.isArray(w.secrets) ? w.secrets : []) {
+      if (!sec || typeof sec !== 'object') continue;
+      const k = str(sec.kind).toLowerCase() || 'other';
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(sec);
+    }
+    const kinds = [...KIND_ORDER.filter((k) => groups.has(k)), ...[...groups.keys()].filter((k) => !KIND_ORDER.includes(k))];
+    for (const k of kinds) {
+      const list = groups.get(k);
+      box.append(h('div', { class: 'wg' },
+        h('div', { class: 'wg-h' }, KIND_LABEL[k] || k, h('span', { class: 'wg-n', text: String(list.length) })),
+        h('div', { class: 'wg-list' }, list.map(credRow))));
+    }
+    if (!kinds.length) box.append(h('div', { class: 'tl-empty', text: 'No credentials provided.' }));
+  }
+
+  const MASK = '••••••••••';
+
+  function credRow(sec) {
+    const value = str(sec.value);
+    const val = h('span', { class: 'cred-val', role: 'button', tabindex: '0', title: 'Click to reveal', 'aria-label': 'Reveal value of ' + str(sec.user), text: value ? MASK : '(empty)' });
+    const eye = h('button', { type: 'button', class: 'btn btn-ghost btn-xs btn-icon', title: 'Reveal', 'aria-label': 'Reveal' }, icon('eye'));
+    const copy = h('button', { type: 'button', class: 'btn btn-ghost btn-xs btn-icon', title: 'Copy value', 'aria-label': 'Copy value' }, icon('copy'));
+    let shown = false;
+    const set = (on) => {
+      shown = on && !!value;
+      val.textContent = shown ? value : value ? MASK : '(empty)';
+      val.classList.toggle('shown', shown);
+      val.title = shown ? value : 'Click to reveal';
+      val.setAttribute('role', shown ? 'textbox' : 'button');
+      val.setAttribute('aria-label', shown ? 'Value of ' + str(sec.user) : 'Reveal value of ' + str(sec.user));
+      eye.querySelector('.ico').replaceWith(icon(shown ? 'eyeoff' : 'eye'));
+      eye.title = shown ? 'Hide' : 'Reveal';
+      eye.setAttribute('aria-label', eye.title);
+    };
+    val.addEventListener('click', () => { if (!shown) set(true); });
+    val.addEventListener('keydown', (e) => { if (!shown && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); set(true); } });
+    eye.addEventListener('click', () => set(!shown));
+    copy.addEventListener('click', () => copyText(value, copy));
+    eye.disabled = copy.disabled = !value;
+    return h('div', { class: 'cred' },
+      h('span', { class: 'cred-u', text: str(sec.user) || '-', title: str(sec.user) }),
+      h('span', { class: 'cred-v' }, val, eye, copy),
+      sec.where || sec.grants ? h('span', { class: 'cred-m' },
+        sec.where ? h('span', { class: 'cw', text: str(sec.where) }) : null,
+        sec.grants ? h('span', { class: 'cg', text: str(sec.grants) }) : null) : null);
+  }
+
+  function openRegen() {
+    const e = $('regen-error'); e.hidden = true; e.textContent = '';
+    $('regen-confirm').disabled = false;
+    openModal('regen-modal');
+    setTimeout(() => $('regen-confirm').focus(), 30);
+  }
+
+  async function doRegen() {
+    const btn = $('regen-confirm');
+    btn.disabled = true;
+    try {
+      const w = await api('POST', '/world/regenerate', {});
+      if (w && typeof w === 'object') S.world = w;
+      closeModal($('regen-modal'));
+      renderWorld();
+      toast('World regenerated, new credentials are live', 'ok');
+    } catch (err) {
+      const e = $('regen-error'); e.textContent = err.message; e.hidden = false;
+      btn.disabled = false;
+    }
   }
 
   function settingsPatch() {
@@ -691,15 +909,27 @@
 
   /* modal plumbing */
 
-  let lastFocus = null;
   function openModal(id) {
-    lastFocus = document.activeElement;
-    $(id).hidden = false;
+    const m = $(id);
+    m._lastFocus = document.activeElement;
+    m.hidden = false;
+  }
+  function closeModal(m) {
+    if (!m || m.hidden) return false;
+    m.hidden = true;
+    const f = m._lastFocus;
+    if (f && document.contains(f) && !f.closest('.modal-wrap[hidden]')) { try { f.focus(); } catch (_) {} }
+    return true;
+  }
+  /** Close the topmost open modal (stacked confirm dialogs first). */
+  function closeTopModal() {
+    const open = [...document.querySelectorAll('.modal-wrap')].filter((m) => !m.hidden);
+    open.sort((a, b) => (+getComputedStyle(b).zIndex || 0) - (+getComputedStyle(a).zIndex || 0));
+    return closeModal(open[0]);
   }
   function closeModals() {
     let closed = false;
-    for (const m of document.querySelectorAll('.modal-wrap')) if (!m.hidden) { m.hidden = true; closed = true; }
-    if (closed && lastFocus && document.contains(lastFocus)) { try { lastFocus.focus(); } catch (_) {} }
+    for (const m of document.querySelectorAll('.modal-wrap')) if (closeModal(m)) closed = true;
     return closed;
   }
   const anyModalOpen = () => [...document.querySelectorAll('.modal-wrap')].some((m) => !m.hidden);
@@ -740,6 +970,8 @@
       h('div', { class: 'ip-main' },
         h('div', { class: 'ip-l1' },
           r.ip = h('span', { class: 'ip-addr' }),
+          r.ms = h('span', { class: 'ms', hidden: true },
+            MILESTONES.map((m) => h('span', { class: 'ms-c ms-' + m.k, text: m.short }))),
           r.ago = h('span', { class: 'ip-ago' })),
         h('div', { class: 'ip-l2' },
           r.loc = h('span', { class: 'ip-loc' }),
@@ -774,6 +1006,19 @@
     setText(r.count, fmtNum(info.count || 0));
     setText(r.ai, 'ai ' + fmtNum(info.ai_count || 0));
     r.ai.classList.toggle('zero', !info.ai_count);
+    paintMilestones(r.ms, info.milestones);
+    el.classList.toggle('ms-rooted', msList(info.milestones).includes('root'));
+  }
+
+  function paintMilestones(wrap, value) {
+    const got = new Set(msList(value));
+    const known = MILESTONES.filter((m) => got.has(m.k));
+    wrap.hidden = known.length === 0;
+    if (wrap.hidden) return;
+    MILESTONES.forEach((m, i) => wrap.children[i].classList.toggle('on', got.has(m.k)));
+    const label = 'Reached: ' + known.map((m) => m.label).join(' › ');
+    wrap.title = label;
+    wrap.setAttribute('aria-label', label);
   }
 
   function matchesQuery(info) {
@@ -797,6 +1042,8 @@
         info = Object.assign({}, info, { last_seen: old.last_seen, count: old.count, ai_count: old.ai_count,
           terminal_count: old.terminal_count, last_method: old.last_method, last_path: old.last_path, last_ua: old.last_ua });
       }
+      // Milestones only ever grow: never let an out-of-order message take one away.
+      if (old.milestones != null || info.milestones != null) info = Object.assign({}, info, { milestones: msUnion(old.milestones, info.milestones) });
       e.info = info;
     }
     paintRow(e);
@@ -1077,8 +1324,33 @@
           h('div', { class: 'iph-ip' }, h('span', { class: 'ip-big', text: str(info.ip) }), copyBtn),
           h('div', { class: 'iph-geo' + (info.geo === 'pending' ? ' pending' : ''), text: geoLine })),
         status),
+      killChain(info) || '',
       grid, foot);
     headerRefs = { status };
+  }
+
+  /** Progress strip creds › db › login › user › root. Hidden on backends without milestone support. */
+  function killChain(info) {
+    if (info.milestones == null) return null;
+    const got = new Set(msList(info.milestones));
+    const n = MILESTONES.filter((m) => got.has(m.k)).length;
+    const rooted = got.has('root');
+    return h('div', { class: 'kc' + (rooted ? ' rooted' : '') },
+      h('div', { class: 'kc-head' },
+        h('span', { class: 'section-label', text: 'Attack progress' }),
+        h('span', { class: 'kc-stage' },
+          n ? [h('b', { text: n + '/' + MILESTONES.length }), rooted ? ' milestones, root shell obtained' : ' milestones reached']
+            : 'no milestones reached yet')),
+      h('ol', { class: 'kc-steps' },
+        MILESTONES.map((m, i) => h('li', {
+          class: 'kc-step kc-' + m.k + (got.has(m.k) ? ' on' : ''),
+          title: m.title + (got.has(m.k) ? ' (reached)' : ' (not yet)'),
+        },
+        h('div', { class: 'kc-top' },
+          h('span', { class: 'kc-n', text: pad(i + 1) }),
+          h('span', { class: 'kc-t', text: m.label }),
+          h('span', { class: 'kc-ok' })),
+        h('span', { class: 'kc-d', text: m.desc })))));
   }
 
   /* event cards */
@@ -1093,18 +1365,19 @@
     const source = str(ev.source);
     const isTerm = kind === 'terminal';
     const chev = icon('chev', 'ev-chev');
+    const flags = msList(ev.flags);
+    const pk = isTerm ? promptKind(ev) : '';
 
     let req;
     if (isTerm) {
-      req = h('span', { class: 'ev-req' },
-        ev.cwd ? h('span', { class: 'ev-cwd', text: str(ev.cwd), title: str(ev.cwd) }) : h('span', { class: 'ev-cwd', text: '' }),
-        h('span', { class: 'ev-path', text: str(ev.cmd), title: str(ev.cmd) }));
+      req = h('span', { class: 'ev-req' }, termHead(ev, pk));
     } else {
       const m = str(ev.method).toUpperCase();
       req = h('span', { class: 'ev-req' },
         h('span', { class: 'ev-method m-' + m.toLowerCase().replace(/[^a-z]/g, ''), text: m }),
         h('span', { class: 'ev-path', text: str(ev.path), title: str(ev.path) }));
     }
+    if (flags.length) req.append(h('span', { class: 'ev-flags' }, flags.map(flagBadge)));
 
     const meta = h('span', { class: 'ev-meta' },
       h('span', { class: 'ev-st' }, !isTerm && ev.status ? h('span', { class: statusClass(ev.status), text: String(ev.status), title: 'HTTP ' + ev.status + ' ' + (STATUS_TEXT[ev.status] || '') }) : null),
@@ -1117,17 +1390,63 @@
       h('span', { class: 'ev-time', title: new Date(ev.ts).toString() },
         h('span', { class: 't', text: fmtClock(ev.ts) }),
         h('span', { class: 'd', text: fmtDay(ev.ts) })),
-      h('span', { class: 'ev-kind' }, h('span', { class: 'badge k-' + kind.replace(/[^a-z]/g, ''), text: kind === 'http' ? 'HTTP' : kind === 'terminal' ? 'TERMINAL' : kind.toUpperCase() })),
+      h('span', { class: 'ev-kind' }, h('span', { class: 'badge k-' + kind.replace(/[^a-z]/g, '') + (pk ? ' p-' + pk : ''), text: kindLabel(kind, pk) })),
       req, meta);
 
     const body = h('div', { class: 'ev-body', hidden: true });
-    const el = h('li', { class: 'ev ev-k-' + kind.replace(/[^a-z]/g, '') + ' ev-s-' + source.replace(/[^a-z]/g, '') },
+    const el = h('li', { class: 'ev ev-k-' + kind.replace(/[^a-z]/g, '') + ' ev-s-' + source.replace(/[^a-z]/g, '') +
+      (flags.length ? ' ev-hit' : '') + (flags.includes('root') ? ' ev-hit-root' : '') },
       h('span', { class: 'ev-dot' }),
       h('div', { class: 'ev-card' }, head, body));
 
     const it = { ev, el, head, body, full: 'resp_headers' in ev || 'req_headers' in ev, built: false, tab: 'resp' };
     head.addEventListener('click', () => toggleEvent(it));
     return it;
+  }
+
+  function kindLabel(kind, pk) {
+    if (kind === 'http') return 'HTTP';
+    if (kind === 'terminal') return pk === 'sql' ? 'MYSQL' : pk === 'pw' ? 'PASSWORD' : 'TERMINAL';
+    return kind.toUpperCase();
+  }
+
+  /** user@host:cwd$ as styled spans. Without term_user (older backends) only the cwd is shown. */
+  function shellPrompt(ev, cls) {
+    const user = str(ev.term_user);
+    const root = user === 'root';
+    if (!user) {
+      return h('span', { class: cls, title: str(ev.cwd) || null },
+        h('span', { class: 'pc', text: str(ev.cwd) || '~' }), h('span', { class: 'ps', text: '$' }));
+    }
+    const host = termHost(ev);
+    const cwd = shortCwd(ev.cwd, user);
+    return h('span', { class: cls, title: user + (host ? '@' + host : '') + ':' + (str(ev.cwd) || cwd) },
+      h('span', { class: 'pu' + (root ? ' root' : ''), text: user }),
+      host ? h('span', { class: 'ph', text: '@' + host }) : null,
+      h('span', { class: 'pc', text: ':' + cwd }),
+      h('span', { class: 'ps' + (root ? ' root' : ''), text: root ? '#' : '$' }));
+  }
+  function shellPromptText(ev) {
+    const user = str(ev.term_user);
+    if (!user) return (str(ev.cwd) || '~') + ' $';
+    const host = termHost(ev);
+    return user + (host ? '@' + host : '') + ':' + shortCwd(ev.cwd, user) + (user === 'root' ? '#' : '$');
+  }
+
+  const PW_TITLE = 'Hidden password input, not echoed back to the attacker';
+
+  function termHead(ev, pk) {
+    const cmd = str(ev.cmd);
+    if (pk === 'pw') {
+      return [
+        h('span', { class: 'ev-pw', title: PW_TITLE }, icon('key'), h('span', { class: 'pp', text: str(ev.prompt).trim() })),
+        h('span', { class: 'pwv', text: cmd || '(empty)', title: cmd }),
+      ];
+    }
+    if (pk === 'sql' || pk === 'other') {
+      return [h('span', { class: 'pm', text: str(ev.prompt).trim() }), h('span', { class: 'ev-path', text: cmd, title: cmd })];
+    }
+    return [shellPrompt(ev, 'ev-prompt'), h('span', { class: 'ev-path', text: cmd, title: cmd })];
   }
 
   const SOURCE_TITLE = {
@@ -1233,9 +1552,23 @@
 
   function terminalBlock(ev) {
     const pre = h('pre', { class: 'raw term' });
-    const cwd = str(ev.cwd) || '~';
     const out = str(ev.resp_body);
-    pre.append(h('span', { class: 'p-cwd', text: cwd }), h('span', { class: 'p-sym', text: ' $ ' }), h('span', { class: 'p-cmd', text: str(ev.cmd) }), '\n');
+    const cmd = str(ev.cmd);
+    const pk = promptKind(ev);
+    let first;
+    if (pk === 'pw') {
+      const p = str(ev.prompt);
+      pre.append(h('span', { class: 'ps', text: p }), h('span', { class: 'pwv', text: cmd, title: PW_TITLE }), h('span', { class: 'p-note', text: '   (hidden input)' }), '\n');
+      first = p + cmd;
+    } else if (pk === 'shell') {
+      const pt = shellPromptText(ev);
+      pre.append(shellPrompt(ev, 'p-prompt'), ' ', h('span', { class: 'p-cmd', text: cmd }), '\n');
+      first = pt + ' ' + cmd;
+    } else {
+      const p = str(ev.prompt);
+      pre.append(h('span', { class: 'pm', text: p }), h('span', { class: 'p-cmd', text: cmd }), '\n');
+      first = p + cmd;
+    }
     let extra = null;
     if (out.length > BODY_LIMIT) {
       const o = h('span', { class: 'out', text: out.slice(0, BODY_LIMIT) });
@@ -1245,7 +1578,7 @@
     } else {
       pre.append(h('span', { class: 'out', text: out }));
     }
-    return { pre, raw: cwd + ' $ ' + str(ev.cmd) + '\n' + out, extra };
+    return { pre, raw: first + '\n' + out, extra };
   }
 
   function metaRow(ev) {
@@ -1258,7 +1591,9 @@
     add('tokens', ev.tokens ? fmtNum(ev.tokens) : '');
     add('latency', fmtLat(ev.latency_ms));
     add('session', ev.session);
-    if (ev.kind === 'terminal') add('ua', ev.user_agent);
+    if (ev.kind === 'terminal') { add('user', ev.term_user); add('cwd', ev.cwd); add('ua', ev.user_agent); }
+    const flags = msList(ev.flags);
+    if (flags.length) items.push(h('span', null, 'milestones', flags.map(flagBadge)));
     return h('div', { class: 'ev-metarow' }, items);
   }
 
@@ -1338,7 +1673,7 @@
     $('auth-form').addEventListener('submit', onAuthSubmit);
     $('ai-switch').addEventListener('click', toggleAI);
     $('ai-state').addEventListener('click', () => { if ($('ai-toggle').dataset.state === 'warn') openSettings(); });
-    $('btn-settings').addEventListener('click', openSettings);
+    $('btn-settings').addEventListener('click', () => openSettings());
     $('btn-clear').addEventListener('click', openClear);
     $('btn-logout').addEventListener('click', logout);
     $('load-older').addEventListener('click', loadOlder);
@@ -1371,7 +1706,18 @@
     });
 
     // modals
-    for (const el of document.querySelectorAll('[data-close]')) el.addEventListener('click', closeModals);
+    for (const el of document.querySelectorAll('[data-close]')) el.addEventListener('click', () => closeModal(el.closest('.modal-wrap')));
+    for (const t of document.querySelectorAll('#settings-modal .mtab')) t.addEventListener('click', () => showSettingsTab(t.dataset.tab));
+    $('settings-modal').querySelector('.mtabs').addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const tabs = [...document.querySelectorAll('#settings-modal .mtab')];
+      const i = tabs.findIndex((t) => t.classList.contains('active'));
+      const next = tabs[(i + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length];
+      showSettingsTab(next.dataset.tab);
+      next.focus();
+    });
+    $('world-regen').addEventListener('click', openRegen);
+    $('regen-confirm').addEventListener('click', doRegen);
     $('settings-save').addEventListener('click', onSaveSettings);
     $('settings-form').addEventListener('submit', (e) => { e.preventDefault(); onSaveSettings(); });
     $('set-test').addEventListener('click', testConnection);
@@ -1387,7 +1733,7 @@
     document.addEventListener('keydown', (e) => {
       if (!S.authed || $('app').hidden) return;
       if (e.key === 'Escape') {
-        if (closeModals()) { e.preventDefault(); return; }
+        if (closeTopModal()) { e.preventDefault(); return; }
         if (window.matchMedia('(max-width: 860px)').matches && S.selected) deselect();
         return;
       }

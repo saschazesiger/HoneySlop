@@ -22,16 +22,26 @@ const (
 	maxHistoryCmds  = 400     // commands per session kept for replay/context
 )
 
+// TermState is the full state of a web-shell session, serialized between HTTP requests.
+type TermState struct {
+	Ctx     ShellCtx     `json:"ctx"`
+	Stack   []ShellCtx   `json:"stack,omitempty"`   // parent shells (su / sudo -i chain)
+	Pending *Pending     `json:"pending,omitempty"` // waiting for a hidden password line
+	Mysql   *MySQLClient `json:"mysql,omitempty"`   // inside the interactive mysql monitor
+}
+
+func defaultTermState() TermState {
+	return TermState{Ctx: ShellCtx{User: termDefaultUser, Cwd: termDefaultCwd, Env: map[string]string{}}}
+}
+
+// termLine is one rendered history row sent to the browser.
 type termLine struct {
 	Cmd    string `json:"cmd"`
 	Output string `json:"output"`
 	Cwd    string `json:"cwd"`
 	User   string `json:"user"`
-}
-
-type termState struct {
-	Cwd  string `json:"cwd"`
-	User string `json:"user"`
+	Prompt string `json:"prompt,omitempty"` // "" shell, "mysql> ", "    -> ", "Password: " ...
+	Hidden bool   `json:"hidden,omitempty"` // command was typed into a hidden password prompt
 }
 
 func newSessionID() string {
@@ -65,30 +75,71 @@ func (a *App) termSession(w http.ResponseWriter, r *http.Request) string {
 	return sid
 }
 
-// state after each event is stored in the event's response headers (X-Cwd / X-User)
-func stateAfter(e Event) termState {
-	st := termState{Cwd: e.RespHeaders.Get("X-Cwd"), User: e.RespHeaders.Get("X-User")}
-	if st.Cwd == "" {
-		st.Cwd = e.Cwd
+// loadTermState reconstructs the session state from the last stored terminal event.
+func loadTermState(hist []Event) TermState {
+	for i := len(hist) - 1; i >= 0; i-- {
+		if hist[i].TermState != "" {
+			var st TermState
+			if err := json.Unmarshal([]byte(hist[i].TermState), &st); err == nil {
+				if st.Ctx.Env == nil {
+					st.Ctx.Env = map[string]string{}
+				}
+				if st.Ctx.User == "" {
+					st.Ctx.User = termDefaultUser
+				}
+				if st.Ctx.Cwd == "" {
+					st.Ctx.Cwd = termDefaultCwd
+				}
+				return st
+			}
+		}
 	}
-	if st.User == "" {
-		st.User = termDefaultUser
+	return defaultTermState()
+}
+
+// nextPrompt reports the prompt the browser should show given the state after a command.
+func nextPrompt(st TermState) (prompt string, hidden bool) {
+	switch {
+	case st.Pending != nil:
+		return promptText(st.Pending), true
+	case st.Mysql != nil:
+		if st.Mysql.Buf != "" {
+			return "    -> ", false // mid-statement continuation
+		}
+		return "mysql> ", false
+	default:
+		return "", false
 	}
-	return st
+}
+
+func promptText(p *Pending) string {
+	switch p.Kind {
+	case "sudo":
+		if p.SudoPrompt != "" {
+			return p.SudoPrompt
+		}
+		return "[sudo] password for " + p.User + ": "
+	case "mysql", "mysqldump":
+		return "Enter password: "
+	default:
+		return "Password: "
+	}
 }
 
 func (a *App) handleTerminalPage(w http.ResponseWriter, r *http.Request) {
 	sid := a.termSession(w, r)
 	hist, _ := a.store.TerminalHistory(sid, maxHistoryCmds)
-	state := termState{Cwd: termDefaultCwd, User: termDefaultUser}
+	st := loadTermState(hist)
 	lines := make([]termLine, 0, len(hist))
 	for _, e := range hist {
-		before := state
-		state = stateAfter(e)
-		lines = append(lines, termLine{Cmd: e.Cmd, Output: e.RespBody, Cwd: before.Cwd, User: before.User})
+		prompt, hidden := renderHistoryPrompt(e.Prompt)
+		lines = append(lines, termLine{Cmd: e.Cmd, Output: e.RespBody, Cwd: e.Cwd, User: termUserOr(e.TermUser),
+			Prompt: prompt, Hidden: hidden})
 	}
+	prompt, hidden := nextPrompt(st)
 	boot, _ := json.Marshal(map[string]any{
-		"host": termHost, "cwd": state.Cwd, "user": state.User, "history": lines, "motd": motd(),
+		"host": termHost, "cwd": st.Ctx.Cwd, "user": st.Ctx.User, "history": lines, "motd": motd(),
+		"prompt": prompt, "hidden": hidden,
 	})
 	page := strings.Replace(web.TerminalHTML, "{{BOOT}}", string(boot), 1)
 
@@ -102,6 +153,32 @@ func (a *App) handleTerminalPage(w http.ResponseWriter, r *http.Request) {
 	ev.RespHeaders = w.Header().Clone()
 	ev.RespBody = "[web terminal page served]"
 	a.record(ev)
+}
+
+func termUserOr(u string) string {
+	if u == "" {
+		return termDefaultUser
+	}
+	return u
+}
+
+// renderHistoryPrompt maps a stored input-prompt string to what the browser should show for that line.
+func renderHistoryPrompt(stored string) (prompt string, hidden bool) {
+	switch {
+	case isSQLPrompt(stored):
+		return "mysql> ", false
+	case isPasswordPrompt(stored):
+		return stored, true // password line: prompt shown, input masked
+	default:
+		return "", false
+	}
+}
+
+func isPasswordPrompt(s string) bool { return strings.Contains(strings.ToLower(s), "pass") }
+
+func isSQLPrompt(s string) bool {
+	t := strings.TrimSpace(s)
+	return t == "mysql>" || t == "->" || t == "mysql> " || t == "    ->"
 }
 
 func motd() string {
@@ -134,73 +211,145 @@ To see these additional updates run: apt list --upgradable
 Last login: %s from 10.20.1.15`, now.Format("Mon 02 Jan 2006 03:04:05 PM UTC"), last.Format("Mon Jan  2 15:04:05 2006"))
 }
 
-// handleTerminalCommand executes one command of the fake shell (POST / with JSON).
+// handleTerminalCommand executes one line of the fake shell (POST / with JSON).
 func (a *App) handleTerminalCommand(w http.ResponseWriter, r *http.Request, body string) {
 	var in struct {
 		Cmd string `json:"cmd"`
 	}
 	_ = json.Unmarshal([]byte(body), &in)
-	cmd := strings.TrimSpace(truncate(in.Cmd, 4000))
+	cmd := strings.TrimSpace(truncate(in.Cmd, 8000))
 	sid := a.termSession(w, r)
 	start := time.Now()
 
 	hist, _ := a.store.TerminalHistory(sid, maxHistoryCmds)
-	state := termState{Cwd: termDefaultCwd, User: termDefaultUser}
-	if len(hist) > 0 {
-		state = stateAfter(hist[len(hist)-1])
-	}
+	st := loadTermState(hist)
+	st.Ctx.SID = sid
 
-	reqBody, _ := json.Marshal(map[string]string{"cmd": cmd}) // store only what matters, not padding
+	// store only the command, not padding; mask nothing server-side (operator wants to see attempts)
+	reqBody, _ := json.Marshal(map[string]string{"cmd": in.Cmd})
 	ev := a.newEvent(r, "terminal", string(reqBody))
-	ev.Method, ev.Path, ev.Cmd, ev.Cwd, ev.Session = "SHELL", "/", cmd, state.Cwd, sid
-	next := state
-	var output string
+	ev.Method, ev.Path, ev.Cmd, ev.Cwd, ev.Session = "SHELL", "/", cmd, st.Ctx.Cwd, sid
+	ev.TermUser = st.Ctx.User
 
 	cfg := a.cfg.Get()
-	switch first := strings.Fields(cmd + " x")[0]; {
-	case cmd == "":
+	// input mode of THIS line (before dispatch): password continuation, sql monitor or normal shell
+	inPrompt := ""
+	if st.Pending != nil {
+		inPrompt = promptText(st.Pending)
+	} else if st.Mysql != nil {
+		inPrompt = "mysql>"
+	}
+	res, llmNeeded := a.dispatchTerminal(r.Context(), &st, cmd, hist, cfg)
+	if llmNeeded {
+		if !cfg.AIEnabled || cfg.OpenRouterKey == "" {
+			res.Output = "-bash: fork: retry: Resource temporarily unavailable"
+			ev.Source = "disabled"
+		} else if !a.limiter.Allow(ev.IP) {
+			res.Output = "-bash: fork: retry: Resource temporarily unavailable"
+			ev.Source = "ratelimited"
+		} else {
+			lres, out, err := a.generateTerminal(r.Context(), hist, st.Ctx, cmd, res.Facts)
+			if err != nil {
+				log.Printf("llm terminal %s: %v", ev.IP, err)
+				res.Output, ev.Source = "-bash: fork: Cannot allocate memory", "error"
+			} else {
+				res.Output = out.Output
+				ev.Model, ev.Tokens, ev.Source = lres.Model, lres.Tokens, "ai"
+				// the LLM may move the working directory, but it can NEVER change the user (privilege is enforced in Go)
+				if strings.HasPrefix(out.Cwd, "/") {
+					st.Ctx.Cwd = out.Cwd
+				}
+			}
+		}
+	} else {
 		ev.Source = "static"
-	case first == "exit" || first == "logout":
-		ev.Source, output = "static", "logout"
-	case cmd == "pwd":
-		ev.Source, output = "static", state.Cwd
-	case cmd == "whoami":
-		ev.Source, output = "static", state.User
-	case cmd == "hostname":
-		ev.Source, output = "static", termHost
-	case !cfg.AIEnabled || cfg.OpenRouterKey == "":
-		ev.Source, output = "disabled", "-bash: fork: retry: Resource temporarily unavailable"
-	default:
-		if !a.limiter.Allow(ev.IP) {
-			ev.Source, output = "ratelimited", "-bash: fork: retry: Resource temporarily unavailable"
-			break
-		}
-		res, out, err := a.generateTerminal(r.Context(), hist, state, cmd)
-		if err != nil {
-			log.Printf("llm terminal %s: %v", ev.IP, err)
-			ev.Source, output = "error", "-bash: fork: Cannot allocate memory"
-			break
-		}
-		ev.Source, ev.Model, ev.Tokens = "ai", res.Model, res.Tokens
-		output = out.Output
-		if strings.HasPrefix(out.Cwd, "/") {
-			next.Cwd = out.Cwd
-		}
-		if u := strings.TrimSpace(out.User); u != "" && !strings.ContainsAny(u, " /\n") {
-			next.User = u
-		}
 	}
 
-	resp := map[string]string{"output": output, "cwd": next.Cwd, "user": next.User}
+	// milestones reached by this command (label the event now; persist the aggregate after record)
+	var newly []string
+	if len(res.Flags) > 0 {
+		newly = a.store.PreviewMilestones(ev.IP, res.Flags)
+	}
+	ev.Flags = strings.Join(newly, ",")
+
+	// response prompt describes the NEXT line; the stored ev.Prompt describes THIS line's input mode
+	prompt, promptHidden := nextPrompt(st)
+	ev.Prompt = inPrompt
+	stJSON, _ := json.Marshal(st)
+	ev.TermState = string(stJSON)
+
+	resp := map[string]any{
+		"output": res.Output, "cwd": st.Ctx.Cwd, "user": st.Ctx.User,
+		"prompt": prompt, "hidden": promptHidden,
+	}
+	if len(newly) > 0 {
+		resp["flags"] = newly
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Server", serverHeader)
 	_ = json.NewEncoder(w).Encode(resp)
 
 	ev.Status = 200
-	ev.RespHeaders = http.Header{"X-Cwd": {next.Cwd}, "X-User": {next.User}}
-	ev.RespBody = output
+	ev.RespBody = res.Output
 	ev.LatencyMS = time.Since(start).Milliseconds()
 	a.record(ev)
+}
+
+// dispatchTerminal routes one line to the right handler and mutates st in place.
+// Returns the result and whether the LLM must still produce the output.
+func (a *App) dispatchTerminal(ctx context.Context, st *TermState, cmd string, hist []Event, cfg Config) (ShellResult, bool) {
+	// 1. a hidden password / continuation line
+	if st.Pending != nil {
+		p := st.Pending
+		st.Pending = nil
+		res := a.shell().Continue(ctx, &st.Ctx, p, cmd)
+		a.applyShellResult(st, res)
+		return res, false
+	}
+	// 2. inside the interactive mysql monitor
+	if st.Mysql != nil {
+		out, next, _ := a.mysql().Line(ctx, st.Ctx.SID, *st.Mysql, cmd)
+		res := ShellResult{Cwd: st.Ctx.Cwd, User: st.Ctx.User, Handled: true, Output: out}
+		st.Mysql = next
+		return res, false
+	}
+	// 3. exit/logout pops a nested shell (su / sudo -i) before anything else
+	if t := strings.TrimSpace(cmd); (t == "exit" || t == "logout" || t == "exit;") && len(st.Stack) > 0 {
+		parent := st.Stack[len(st.Stack)-1]
+		st.Stack = st.Stack[:len(st.Stack)-1]
+		st.Ctx.User, st.Ctx.Cwd, st.Ctx.Env = parent.User, parent.Cwd, parent.Env
+		return ShellResult{Cwd: st.Ctx.Cwd, User: st.Ctx.User, Handled: true, Output: ""}, false
+	}
+	// 4. normal command
+	res := a.shell().Run(ctx, &st.Ctx, cmd)
+	a.applyShellResult(st, res)
+	if res.Handled {
+		return res, false
+	}
+	return res, true
+}
+
+// applyShellResult folds a ShellResult into the session state (user switches push/pop the shell stack).
+func (a *App) applyShellResult(st *TermState, res ShellResult) {
+	if res.Interact != nil && res.Interact.Mysql != nil {
+		st.Mysql = res.Interact.Mysql
+	}
+	if res.Pending != nil {
+		st.Pending = res.Pending
+		if res.Prompt != "" && res.Pending.Kind == "sudo" {
+			st.Pending.SudoPrompt = res.Prompt
+		}
+	}
+	if res.User != "" && res.User != st.Ctx.User {
+		// privilege change: remember the parent shell so `exit` returns to it
+		parent := st.Ctx
+		st.Stack = append(st.Stack, parent)
+		st.Ctx.User = res.User
+		st.Ctx.Cwd = res.Cwd
+		st.Ctx.Env = map[string]string{}
+	} else if res.Cwd != "" {
+		st.Ctx.Cwd = res.Cwd
+	}
 }
 
 type termReply struct {
@@ -209,25 +358,21 @@ type termReply struct {
 	User   string `json:"user"`
 }
 
-func (a *App) generateTerminal(ctx context.Context, hist []Event, state termState, cmd string) (llmResult, termReply, error) {
+func (a *App) generateTerminal(ctx context.Context, hist []Event, ctxState ShellCtx, cmd, facts string) (llmResult, termReply, error) {
 	cfg := a.cfg.Get()
 	sys := strings.NewReplacer("{{PERSONA}}", cfg.Persona, "{{DATE}}", time.Now().UTC().Format("Mon Jan 2 15:04:05 UTC 2006")).
-		Replace(terminalSystemPrompt)
+		Replace(terminalSystemPrompt) + facts
 
 	prompt := func(user, cwd, c string) string {
 		return fmt.Sprintf("[user=%s cwd=%s]\n$ %s", user, cwd, c)
 	}
-	// Full history as alternating turns, so the shell remembers everything that happened.
 	var turns []chatMessage
-	st := termState{Cwd: termDefaultCwd, User: termDefaultUser}
 	for _, e := range hist {
-		if e.Cmd == "" {
+		if e.Cmd == "" || isPasswordPrompt(e.Prompt) {
 			continue
 		}
-		after := stateAfter(e)
-		reply, _ := json.Marshal(termReply{Output: e.RespBody, Cwd: after.Cwd, User: after.User})
-		turns = append(turns, chatMessage{"user", prompt(st.User, e.Cwd, e.Cmd)}, chatMessage{"assistant", string(reply)})
-		st = after
+		reply, _ := json.Marshal(termReply{Output: e.RespBody, Cwd: e.Cwd, User: termUserOr(e.TermUser)})
+		turns = append(turns, chatMessage{"user", prompt(termUserOr(e.TermUser), e.Cwd, e.Cmd)}, chatMessage{"assistant", string(reply)})
 	}
 	size := 0
 	for _, t := range turns {
@@ -238,7 +383,7 @@ func (a *App) generateTerminal(ctx context.Context, hist []Event, state termStat
 		turns = turns[2:]
 	}
 	msgs := append([]chatMessage{{"system", sys}}, turns...)
-	msgs = append(msgs, chatMessage{"user", prompt(state.User, state.Cwd, cmd)})
+	msgs = append(msgs, chatMessage{"user", prompt(ctxState.User, ctxState.Cwd, cmd)})
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
@@ -248,7 +393,7 @@ func (a *App) generateTerminal(ctx context.Context, hist []Event, state termStat
 	}
 	var out termReply
 	if err := extractJSON(res.Content, &out); err != nil {
-		out = termReply{Output: strings.TrimSpace(res.Content), Cwd: state.Cwd, User: state.User}
+		out = termReply{Output: strings.TrimSpace(res.Content), Cwd: ctxState.Cwd, User: ctxState.User}
 	}
 	out.Output = strings.TrimRight(out.Output, "\n")
 	return res, out, nil

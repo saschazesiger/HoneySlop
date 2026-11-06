@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS events (
   session TEXT NOT NULL DEFAULT '',
   cmd TEXT NOT NULL DEFAULT '',
   cwd TEXT NOT NULL DEFAULT '',
-  user_agent TEXT NOT NULL DEFAULT ''
+  user_agent TEXT NOT NULL DEFAULT '',
+  flags TEXT NOT NULL DEFAULT '',
+  prompt TEXT NOT NULL DEFAULT '',
+  term_user TEXT NOT NULL DEFAULT '',
+  term_state TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_ip ON events(ip, id);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
@@ -56,10 +60,20 @@ CREATE TABLE IF NOT EXISTS ips (
   geo TEXT NOT NULL DEFAULT 'pending',
   last_method TEXT NOT NULL DEFAULT '',
   last_path TEXT NOT NULL DEFAULT '',
-  last_ua TEXT NOT NULL DEFAULT ''
+  last_ua TEXT NOT NULL DEFAULT '',
+  milestones TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ips_last ON ips(last_seen);
 `
+
+// migrations add columns to databases created by older versions (CREATE TABLE IF NOT EXISTS won't).
+var migrations = []string{
+	`ALTER TABLE events ADD COLUMN flags TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE events ADD COLUMN prompt TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE events ADD COLUMN term_user TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE events ADD COLUMN term_state TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE ips ADD COLUMN milestones TEXT NOT NULL DEFAULT ''`,
+}
 
 type Event struct {
 	ID          int64       `json:"id"`
@@ -84,6 +98,10 @@ type Event struct {
 	Cmd         string      `json:"cmd"`
 	Cwd         string      `json:"cwd"`
 	UserAgent   string      `json:"user_agent"`
+	Flags       string      `json:"flags"`     // milestones newly reached by this event (comma separated)
+	Prompt      string      `json:"prompt"`    // terminal: input mode of the NEXT line ("" normal, "Password: ", "mysql> ", ...)
+	TermUser    string      `json:"term_user"` // terminal: unix user that ran the command
+	TermState   string      `json:"-"`         // terminal: serialized session state after the command (replay)
 }
 
 // Summary strips the heavy fields for list/stream use.
@@ -111,6 +129,7 @@ type IPInfo struct {
 	LastMethod    string `json:"last_method"`
 	LastPath      string `json:"last_path"`
 	LastUA        string `json:"last_ua"`
+	Milestones    string `json:"milestones"` // cumulative kill-chain milestones reached by this IP (comma separated)
 }
 
 type Store struct {
@@ -125,6 +144,9 @@ func OpenStore(path string) (*Store, error) {
 	db.SetMaxOpenConns(1) // SQLite: serialize access, avoids SQLITE_BUSY entirely
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
+	}
+	for _, m := range migrations {
+		_, _ = db.Exec(m) // ignore "duplicate column name" on already-migrated DBs
 	}
 	return &Store{db: db}, nil
 }
@@ -146,10 +168,11 @@ func (s *Store) InsertEvent(e *Event) (IPInfo, bool, error) {
 	}
 	defer tx.Rollback()
 	res, err := tx.Exec(`INSERT INTO events (ts, ip, kind, method, scheme, host, path, proto, req_headers, req_body, status,
-		resp_headers, resp_body, source, model, latency_ms, tokens, session, cmd, cwd, user_agent)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		resp_headers, resp_body, source, model, latency_ms, tokens, session, cmd, cwd, user_agent, flags, prompt, term_user, term_state)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		e.TS, e.IP, e.Kind, e.Method, e.Scheme, e.Host, e.Path, e.Proto, headerJSON(e.ReqHeaders), e.ReqBody, e.Status,
-		headerJSON(e.RespHeaders), e.RespBody, e.Source, e.Model, e.LatencyMS, e.Tokens, e.Session, e.Cmd, e.Cwd, e.UserAgent)
+		headerJSON(e.RespHeaders), e.RespBody, e.Source, e.Model, e.LatencyMS, e.Tokens, e.Session, e.Cmd, e.Cwd, e.UserAgent,
+		e.Flags, e.Prompt, e.TermUser, e.TermState)
 	if err != nil {
 		return IPInfo{}, false, err
 	}
@@ -165,7 +188,14 @@ func (s *Store) InsertEvent(e *Event) (IPInfo, bool, error) {
 	}
 	lastPath := e.Path
 	if e.Kind == "terminal" {
-		lastPath = "$ " + e.Cmd
+		sym := "$ "
+		if e.TermUser == "root" {
+			sym = "# "
+		}
+		if strings.HasPrefix(e.Prompt, "mysql>") || strings.HasPrefix(e.Prompt, "    ->") {
+			sym = "mysql> "
+		}
+		lastPath = sym + e.Cmd
 	}
 	var existing int
 	_ = tx.QueryRow(`SELECT COUNT(*) FROM ips WHERE ip=?`, e.IP).Scan(&existing)
@@ -184,15 +214,65 @@ func (s *Store) InsertEvent(e *Event) (IPInfo, bool, error) {
 	return info, existing == 0, tx.Commit()
 }
 
-const ipCols = `ip, first_seen, last_seen, count, ai_count, terminal_count, country, country_code, region, city, org, asn, isp, geo, last_method, last_path, last_ua`
+const ipCols = `ip, first_seen, last_seen, count, ai_count, terminal_count, country, country_code, region, city, org, asn, isp, geo, last_method, last_path, last_ua, milestones`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanIP(r scanner) (IPInfo, error) {
 	var i IPInfo
 	err := r.Scan(&i.IP, &i.FirstSeen, &i.LastSeen, &i.Count, &i.AICount, &i.TerminalCount, &i.Country, &i.CountryCode,
-		&i.Region, &i.City, &i.Org, &i.ASN, &i.ISP, &i.Geo, &i.LastMethod, &i.LastPath, &i.LastUA)
+		&i.Region, &i.City, &i.Org, &i.ASN, &i.ISP, &i.Geo, &i.LastMethod, &i.LastPath, &i.LastUA, &i.Milestones)
 	return i, err
+}
+
+// AddMilestones merges new milestones into an IP's set and returns the ones that were newly reached
+// (empty if none) together with the full updated set.
+func (s *Store) AddMilestones(ip string, add []string) (newly []string, all string, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	var cur string
+	_ = tx.QueryRow(`SELECT milestones FROM ips WHERE ip=?`, ip).Scan(&cur)
+	merged, fresh := MergeMilestones(cur, add)
+	if len(fresh) > 0 {
+		if _, err := tx.Exec(`UPDATE ips SET milestones=? WHERE ip=?`, merged, ip); err != nil {
+			return nil, "", err
+		}
+	}
+	return fresh, merged, tx.Commit()
+}
+
+// PreviewMilestones returns which of add are not yet in the IP's set, without writing (used to
+// label the event; the IP row may not exist yet at this point).
+func (s *Store) PreviewMilestones(ip string, add []string) []string {
+	var cur string
+	_ = s.db.QueryRow(`SELECT milestones FROM ips WHERE ip=?`, ip).Scan(&cur)
+	_, fresh := MergeMilestones(cur, add)
+	return fresh
+}
+
+// MilestoneCounts returns, per milestone key, how many distinct IPs reached it.
+func (s *Store) MilestoneCounts() (map[string]int, error) {
+	rows, err := s.db.Query(`SELECT milestones FROM ips WHERE milestones<>''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		for _, k := range strings.Split(m, ",") {
+			if k = strings.TrimSpace(k); k != "" {
+				out[k]++
+			}
+		}
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) SetGeo(ip string, g IPInfo) (IPInfo, error) {
@@ -234,13 +314,14 @@ func (s *Store) ListIPs(q string, limit int) ([]IPInfo, error) {
 }
 
 const eventCols = `id, ts, ip, kind, method, scheme, host, path, proto, req_headers, req_body, status, resp_headers, resp_body,
-	source, model, latency_ms, tokens, session, cmd, cwd, user_agent`
+	source, model, latency_ms, tokens, session, cmd, cwd, user_agent, flags, prompt, term_user`
 
 func scanEvent(r scanner) (Event, error) {
 	var e Event
 	var rh, sh string
 	err := r.Scan(&e.ID, &e.TS, &e.IP, &e.Kind, &e.Method, &e.Scheme, &e.Host, &e.Path, &e.Proto, &rh, &e.ReqBody, &e.Status,
-		&sh, &e.RespBody, &e.Source, &e.Model, &e.LatencyMS, &e.Tokens, &e.Session, &e.Cmd, &e.Cwd, &e.UserAgent)
+		&sh, &e.RespBody, &e.Source, &e.Model, &e.LatencyMS, &e.Tokens, &e.Session, &e.Cmd, &e.Cwd, &e.UserAgent,
+		&e.Flags, &e.Prompt, &e.TermUser)
 	if err != nil {
 		return e, err
 	}
@@ -289,8 +370,8 @@ func (s *Store) RecentHTTPForIP(ip string, n int) ([]Event, error) {
 
 // TerminalHistory returns the last n terminal commands of a session (only the fields the shell needs), oldest first.
 func (s *Store) TerminalHistory(session string, n int) ([]Event, error) {
-	rows, err := s.db.Query(`SELECT cmd, cwd, resp_headers, resp_body FROM
-		(SELECT id, cmd, cwd, resp_headers, resp_body FROM events WHERE session=? AND kind='terminal' ORDER BY id DESC LIMIT ?)
+	rows, err := s.db.Query(`SELECT cmd, cwd, resp_body, prompt, term_user, term_state FROM
+		(SELECT id, cmd, cwd, resp_body, prompt, term_user, term_state FROM events WHERE session=? AND kind='terminal' ORDER BY id DESC LIMIT ?)
 		ORDER BY id ASC`, session, n)
 	if err != nil {
 		return nil, err
@@ -299,11 +380,9 @@ func (s *Store) TerminalHistory(session string, n int) ([]Event, error) {
 	var out []Event
 	for rows.Next() {
 		var e Event
-		var rh string
-		if err := rows.Scan(&e.Cmd, &e.Cwd, &rh, &e.RespBody); err != nil {
+		if err := rows.Scan(&e.Cmd, &e.Cwd, &e.RespBody, &e.Prompt, &e.TermUser, &e.TermState); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal([]byte(rh), &e.RespHeaders)
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -324,14 +403,15 @@ func (s *Store) Prune(maxAge time.Duration, maxEvents int) (int64, error) {
 }
 
 type Stats struct {
-	EventsTotal     int64 `json:"events_total"`
-	Events24h       int64 `json:"events_24h"`
-	IPsTotal        int64 `json:"ips_total"`
-	IPs24h          int64 `json:"ips_24h"`
-	AICalls24h      int64 `json:"ai_calls_24h"`
-	TerminalCmds24h int64 `json:"terminal_cmds_24h"`
-	AIEnabled       bool  `json:"ai_enabled"`
-	AIReady         bool  `json:"ai_ready"`
+	EventsTotal     int64          `json:"events_total"`
+	Events24h       int64          `json:"events_24h"`
+	IPsTotal        int64          `json:"ips_total"`
+	IPs24h          int64          `json:"ips_24h"`
+	AICalls24h      int64          `json:"ai_calls_24h"`
+	TerminalCmds24h int64          `json:"terminal_cmds_24h"`
+	AIEnabled       bool           `json:"ai_enabled"`
+	AIReady         bool           `json:"ai_ready"`
+	Milestones      map[string]int `json:"milestones,omitempty"`
 }
 
 func (s *Store) Stats() (Stats, error) {

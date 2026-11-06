@@ -99,6 +99,12 @@ func (a *App) record(e *Event) {
 	if isNew || info.Geo == "pending" {
 		a.geo.Resolve(e.IP)
 	}
+	// persist milestones the event just reached, so the pushed IP already reflects them
+	if e.Flags != "" {
+		if _, all, err := a.store.AddMilestones(e.IP, strings.Split(e.Flags, ",")); err == nil {
+			info.Milestones = all
+		}
+	}
 	a.hub.Publish("hit", map[string]any{"ip": info, "event": e.Summary()})
 }
 
@@ -143,25 +149,61 @@ func (a *App) handleHoneypot(w http.ResponseWriter, r *http.Request) {
 
 	ext := strings.ToLower(path.Ext(r.URL.Path))
 	cfg := a.cfg.Get()
-	switch {
-	case binaryExt[ext]:
-		ev.Source = "static"
-	case !cfg.AIEnabled || cfg.OpenRouterKey == "":
-		ev.Source = "disabled"
-	default:
-		if !a.limiter.Allow(ev.IP) {
-			ev.Source = "ratelimited"
-			break
+	var flags []string
+	// deterministic web-app layer first: secret-file leaks and credential-gated login realms.
+	if reply, f, ok := a.webapp().Handle(r, body); ok {
+		ev.Source = "app"
+		status, respBody = reply.status, reply.body
+		if reply.headers != nil {
+			headers = reply.headers
 		}
-		reply, res, err := a.generateHTTP(r.Context(), r, body, ev.IP)
-		if err != nil {
-			log.Printf("llm http %s %s: %v", ev.IP, ev.Path, err)
-			ev.Source = "error"
-			status, respBody = http.StatusBadGateway, nginxPage(502, "Bad Gateway")
-			break
+		flags = f
+	} else {
+		switch {
+		case binaryExt[ext]:
+			ev.Source = "static"
+		case !cfg.AIEnabled || cfg.OpenRouterKey == "":
+			ev.Source = "disabled"
+		default:
+			// per-path cache: a given path only ever costs one LLM call. Only idempotent, body-less
+			// GET/HEAD requests are cached (POST payloads and query-driven probes stay unique via the URI).
+			cacheable := (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.ContentLength <= 0
+			key := cacheKey(r.Method, r.URL.RequestURI())
+			if cacheable {
+				if cr, ok := a.cache.Get(key); ok {
+					ev.Source, ev.Model = "cache", cr.Model
+					status, headers, respBody = cr.Status, cr.Headers, cr.Body
+					if a.world().LeaksSecret(respBody) {
+						flags = append(flags, msCreds)
+					}
+					break
+				}
+			}
+			if !a.limiter.Allow(ev.IP) {
+				ev.Source = "ratelimited"
+				break
+			}
+			reply, res, err := a.generateHTTP(r.Context(), r, body, ev.IP)
+			if err != nil {
+				log.Printf("llm http %s %s: %v", ev.IP, ev.Path, err)
+				ev.Source = "error"
+				status, respBody = http.StatusBadGateway, nginxPage(502, "Bad Gateway")
+				break
+			}
+			ev.Source, ev.Model, ev.Tokens = "ai", res.Model, res.Tokens
+			status, headers, respBody = reply.Status, reply.hdr, reply.Body
+			if cacheable {
+				a.cache.Put(key, &CachedResponse{Status: status, Headers: headers, Body: respBody, Model: res.Model, Created: time.Now()})
+			}
+			// a model response that leaks a real secret still counts as credentials obtained
+			if a.world().LeaksSecret(respBody) {
+				flags = append(flags, msCreds)
+			}
 		}
-		ev.Source, ev.Model, ev.Tokens = "ai", res.Model, res.Tokens
-		status, headers, respBody = reply.Status, reply.hdr, reply.Body
+	}
+
+	if len(flags) > 0 {
+		ev.Flags = strings.Join(a.store.PreviewMilestones(ev.IP, flags), ",")
 	}
 
 	h := w.Header()
@@ -169,7 +211,7 @@ func (a *App) handleHoneypot(w http.ResponseWriter, r *http.Request) {
 		h.Set(k, v)
 	}
 	h.Set("Server", serverHeader)
-	if ev.Source == "ai" {
+	if ev.Source == "ai" || ev.Source == "cache" {
 		h.Set("Content-Security-Policy", sandboxCSP)
 	}
 	w.WriteHeader(status)
@@ -194,7 +236,7 @@ var blockedRespHeaders = map[string]bool{
 
 func (a *App) generateHTTP(ctx context.Context, r *http.Request, body, ip string) (httpReply, llmResult, error) {
 	cfg := a.cfg.Get()
-	sys := strings.NewReplacer("{{PERSONA}}", cfg.Persona, "{{HOST}}", r.Host).Replace(httpSystemPrompt)
+	sys := strings.NewReplacer("{{PERSONA}}", cfg.Persona, "{{HOST}}", r.Host).Replace(httpSystemPrompt) + a.world().httpFacts()
 
 	var u strings.Builder
 	if prev, err := a.store.RecentHTTPForIP(ip, historyForHTTP); err == nil && len(prev) > 0 {

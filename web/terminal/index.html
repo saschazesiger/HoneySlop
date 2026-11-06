@@ -48,14 +48,20 @@
   const boot = JSON.parse(document.getElementById('boot').textContent);
   const term = document.getElementById('term'), inp = document.getElementById('in'), title = document.getElementById('title');
   let cwd = boot.cwd, user = boot.user, busy = false, hist = [], hpos = 0, live = null;
+  // mode: '' = normal shell; otherwise the literal prompt string. hidden = mask typed input (passwords).
+  let mode = boot.prompt || '', hidden = !!boot.hidden;
   const ESC = new RegExp('\\u001b\\[[0-9;?]*[A-Za-z]|\\u001b\\][^\\u0007]*\\u0007', 'g');
 
   const home = u => u === 'root' ? '/root' : u === 'www-data' ? '/var/www' : '/home/' + u;
   const short = (p, u) => { const h = home(u); return p === h ? '~' : p.startsWith(h + '/') ? '~' + p.slice(h.length) : p; };
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const isSql = m => m === 'mysql> ' || m === '    -> ';
 
-  function promptNode(u, p) {
+  // promptNode renders the prompt prefix for a given mode.
+  function promptNode(u, p, m) {
     const s = el('span');
+    if (m && isSql(m)) { s.append(el('span', 'p', m)); return s; }
+    if (m) { s.append(document.createTextNode(m)); return s; }
     s.append(el('span', 'u', `${u}@${boot.host}`), ':', el('span', 'p', short(p, u)), u === 'root' ? '# ' : '$ ');
     return s;
   }
@@ -64,28 +70,35 @@
     const d = el('div', cls || 'out', String(text).replace(ESC, ''));
     term.insertBefore(d, live);
   }
-  function echoCommand(u, p, cmd) {
+  // echo the entered line; for a hidden (password) prompt only the prompt is shown, never the secret.
+  function echoCommand(u, p, cmd, m, h) {
     const d = el('div');
-    d.append(promptNode(u, p), document.createTextNode(cmd));
+    d.append(promptNode(u, p, m), document.createTextNode(h ? '' : cmd));
     term.insertBefore(d, live);
   }
   function renderLive() {
     live.replaceChildren();
     if (busy) { live.append(el('span', 'cursor idle', ' ')); return; }
     const v = inp.value, pos = inp.selectionStart ?? v.length;
-    live.append(promptNode(user, cwd), document.createTextNode(v.slice(0, pos)),
-      el('span', 'cursor', v[pos] && v[pos] !== '\n' ? v[pos] : ' '), document.createTextNode(v.slice(pos + 1)));
+    if (hidden) {
+      live.append(promptNode(user, cwd, mode), el('span', 'cursor', ' '));
+    } else {
+      live.append(promptNode(user, cwd, mode), document.createTextNode(v.slice(0, pos)),
+        el('span', 'cursor', v[pos] && v[pos] !== '\n' ? v[pos] : ' '), document.createTextNode(v.slice(pos + 1)));
+    }
     title.textContent = `${user}@${boot.host}: ${short(cwd, user)}`;
     term.scrollTop = term.scrollHeight;
   }
 
   async function run(cmd) {
-    echoCommand(user, cwd, cmd);
-    if (cmd.trim()) { hist.push(cmd); }
+    const wasHidden = hidden, wasMode = mode;
+    echoCommand(user, cwd, cmd, wasMode, wasHidden);
+    if (cmd.trim() && !wasHidden && !isSql(wasMode)) { hist.push(cmd); }
     hpos = hist.length;
     const t = cmd.trim();
-    if (t === 'clear' || t === 'reset') { [...term.children].forEach(c => c !== live && c.remove()); return; }
-    if (!t) return;
+    // local-only screen helpers (bash and the mysql monitor both clear differently; keep it simple)
+    if (!wasHidden && !isSql(wasMode) && (t === 'clear' || t === 'reset')) { [...term.children].forEach(c => c !== live && c.remove()); return; }
+    if (!t && !wasHidden && !isSql(wasMode)) return;
     busy = true; renderLive();
     try {
       const r = await fetch('/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd }) });
@@ -93,7 +106,10 @@
       print(j.output);
       if (j.cwd) cwd = j.cwd;
       if (j.user) user = j.user;
-      if (t === 'exit' || t === 'logout') { print('Connection to ' + boot.host + ' closed.', 'motd'); }
+      mode = j.prompt || ''; hidden = !!j.hidden;
+      if (!isSql(wasMode) && !wasHidden && (t === 'exit' || t === 'logout') && !isSql(mode) && mode === '') {
+        if (user === 'www-data' && cwd === boot.cwd) { /* top-level logout keeps the page */ }
+      }
     } catch (e) {
       print('-bash: fork: retry: Resource temporarily unavailable', 'err');
     }
@@ -103,7 +119,7 @@
   // initial screen: motd + restored session
   live = el('div'); term.append(live);
   print(boot.motd, 'motd'); print(' ');
-  for (const h of boot.history || []) { echoCommand(h.user, h.cwd, h.cmd); print(h.output); if (h.cmd) hist.push(h.cmd); }
+  for (const h of boot.history || []) { echoCommand(h.user, h.cwd, h.cmd, h.prompt || '', h.hidden); print(h.output); if (h.cmd && !h.hidden) hist.push(h.cmd); }
   hpos = hist.length;
   renderLive();
 

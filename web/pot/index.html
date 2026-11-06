@@ -9,6 +9,8 @@
 <meta name="theme-color" content="#0a0b0d">
 <title>HoneySlop · pot</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a0b0d'/%3E%3Cpath d='M16 5.2l9.4 5.4v10.8L16 26.8l-9.4-5.4V10.6z' fill='none' stroke='%233ddc97' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='M16 12l3.6 2.1v4.1L16 20.3l-3.6-2.1v-4.1z' fill='%233ddc97'/%3E%3C/svg%3E">
+<link rel="preload" href="/pot/static/fonts/tiny5-duo-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/pot/static/fonts/departure-mono-regular.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/pot/static/app.css">
 <script src="/pot/static/app.js" defer></script>
 </head>
@@ -59,6 +61,13 @@
       <div class="chip" title="LLM generated responses in the last 24 hours"><span class="chip-v" id="st-ai24">–</span><span class="chip-l">AI calls 24h</span></div>
       <div class="chip chip-opt" title="Fake-terminal commands in the last 24 hours"><span class="chip-v" id="st-term24">–</span><span class="chip-l">shell cmds 24h</span></div>
       <div class="chip chip-opt chip-muted" title="All-time totals"><span class="chip-v" id="st-total">–</span><span class="chip-l">events total</span></div>
+      <div class="chain-stats" id="chain-stats" title="Attackers that reached each stage of the attack chain" hidden>
+        <span class="cs" data-k="creds" title="Obtained real secrets"><span class="cs-l">creds</span><span class="cs-v">–</span></span>
+        <span class="cs" data-k="db" title="Got database access"><span class="cs-l">db</span><span class="cs-v">–</span></span>
+        <span class="cs" data-k="login" title="Logged into a web app with real credentials"><span class="cs-l">login</span><span class="cs-v">–</span></span>
+        <span class="cs" data-k="user" title="Lateral movement: shell as deploy"><span class="cs-l">user</span><span class="cs-v">–</span></span>
+        <span class="cs cs-root" data-k="root" title="Root shell"><span class="cs-l">root</span><span class="cs-v">–</span></span>
+      </div>
     </div>
     <div class="top-actions">
       <div class="ai-toggle" id="ai-toggle" data-state="off">
@@ -130,9 +139,13 @@
   <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-head">
       <h2 id="settings-title">Settings</h2>
+      <div class="mtabs" role="tablist" aria-label="Settings sections">
+        <button type="button" class="mtab active" role="tab" id="tab-general" data-tab="general" aria-selected="true" aria-controls="settings-form">General</button>
+        <button type="button" class="mtab" role="tab" id="tab-world" data-tab="world" aria-selected="false" aria-controls="world-pane">World</button>
+      </div>
       <button type="button" class="btn btn-ghost btn-icon btn-sm" data-close aria-label="Close"><span class="ico" data-icon="x"></span></button>
     </div>
-    <form class="modal-body" id="settings-form" novalidate autocomplete="off">
+    <form class="modal-body" id="settings-form" role="tabpanel" aria-labelledby="tab-general" novalidate autocomplete="off">
       <section class="set-section">
         <div class="set-title">
           <h3>OpenRouter</h3>
@@ -203,10 +216,39 @@
         </div>
       </section>
     </form>
+    <div class="modal-body" id="world-pane" role="tabpanel" aria-labelledby="tab-world" hidden>
+      <section class="set-section">
+        <div class="set-title">
+          <h3>Generated world</h3>
+          <p>The fake machine every attacker explores. Users, passwords, keys and database contents are generated once and stay consistent across all sessions, so leaked secrets actually work further down the chain.</p>
+        </div>
+        <div class="world-id">
+          <div class="limit"><span class="limit-v" id="world-host">–</span><span class="limit-l">hostname</span></div>
+          <div class="limit"><span class="limit-v" id="world-ip">–</span><span class="limit-l">internal IP</span></div>
+          <div class="limit"><span class="limit-v" id="world-created">–</span><span class="limit-l">generated</span></div>
+          <button type="button" class="btn btn-sm btn-outline-danger" id="world-regen"><span class="ico" data-icon="refresh"></span>Regenerate world</button>
+        </div>
+      </section>
+      <div class="world-msg" id="world-msg" hidden></div>
+      <section class="set-section" id="world-chain-sec">
+        <div class="set-title">
+          <h3>Intended attack chain</h3>
+          <p>The path a determined attacker can walk from the internet to a root shell. Milestones in the dashboard track progress along it.</p>
+        </div>
+        <ol class="wchain" id="world-chain"></ol>
+      </section>
+      <section class="set-section" id="world-creds-sec">
+        <div class="set-title">
+          <h3>Credentials</h3>
+          <p>Every secret planted in the world and where it leaks from. Click a value to reveal it.</p>
+        </div>
+        <div id="world-secrets"></div>
+      </section>
+    </div>
     <div class="modal-foot">
       <span class="form-msg err" id="settings-error" hidden></span>
       <span class="spacer"></span>
-      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="button" class="btn btn-ghost" data-close id="settings-cancel">Cancel</button>
       <button type="button" class="btn btn-primary" id="settings-save">Save changes</button>
     </div>
   </div>
@@ -232,6 +274,32 @@
       <span class="spacer"></span>
       <button type="button" class="btn btn-ghost" data-close>Cancel</button>
       <button type="button" class="btn btn-danger" id="clear-confirm" disabled>Delete everything</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Regenerate-world confirm modal ============ -->
+<div class="modal-wrap modal-top" id="regen-modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal modal-sm" role="alertdialog" aria-modal="true" aria-labelledby="regen-title">
+    <div class="modal-head">
+      <h2 id="regen-title">Regenerate world?</h2>
+      <button type="button" class="btn btn-ghost btn-icon btn-sm" data-close aria-label="Close"><span class="ico" data-icon="x"></span></button>
+    </div>
+    <div class="modal-body">
+      <p class="danger-text">A brand new fake machine is generated:</p>
+      <ul class="danger-list">
+        <li>all passwords, credentials, API keys and SSH keys change</li>
+        <li>database contents (users, customers, hashes) are replaced</li>
+        <li>attackers with a running session suddenly see a different machine, and secrets they already stole stop working</li>
+      </ul>
+      <p class="danger-text">Recorded events and IPs are kept. This cannot be undone.</p>
+      <div class="form-msg err" id="regen-error" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="button" class="btn btn-danger" id="regen-confirm"><span class="ico" data-icon="refresh"></span>Regenerate world</button>
     </div>
   </div>
 </div>

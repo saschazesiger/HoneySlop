@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,8 +41,33 @@ type App struct {
 	llm     *LLM
 	limiter *RateLimiter
 	logins  *LoginLimiter
+	cache   *PathCache
+	eng     atomic.Pointer[engineSet] // world + its engines, swapped atomically on regenerate
+	dataDir string
 	domain  string
 }
+
+// engineSet bundles the world and the engines derived from it, so "regenerate world" can publish a
+// fully consistent new set with a single atomic store (no torn reads from concurrent handlers).
+type engineSet struct {
+	world  *World
+	mysql  *MySQLServer
+	shell  *ShellEngine
+	webapp *WebApp
+}
+
+// setWorld builds the engines for w and publishes them atomically.
+func (a *App) setWorld(w *World) {
+	my := NewMySQLServer(w)
+	es := &engineSet{world: w, mysql: my, shell: NewShellEngine(w, my)}
+	es.webapp = NewWebApp(a, w)
+	a.eng.Store(es)
+}
+
+func (a *App) world() *World       { return a.eng.Load().world }
+func (a *App) mysql() *MySQLServer { return a.eng.Load().mysql }
+func (a *App) shell() *ShellEngine { return a.eng.Load().shell }
+func (a *App) webapp() *WebApp     { return a.eng.Load().webapp }
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -102,13 +128,19 @@ func main() {
 		log.Fatalf("database: %v", err)
 	}
 	hub := NewHub()
+	world, err := LoadOrCreateWorld(*dataDir)
+	if err != nil {
+		log.Fatalf("world: %v", err)
+	}
 	app := &App{
-		cfg: cfg, store: store, hub: hub, domain: domain,
+		cfg: cfg, store: store, hub: hub, domain: domain, dataDir: *dataDir,
 		geo:     NewGeoResolver(store, hub),
 		llm:     NewLLM(cfg),
 		limiter: NewRateLimiter(cfg),
 		logins:  NewLoginLimiter(),
+		cache:   NewPathCache(*dataDir),
 	}
+	app.setWorld(world)
 	// re-resolve IPs whose lookup never finished (e.g. restart)
 	if ips, err := store.ListIPs("", 500); err == nil {
 		for _, i := range ips {

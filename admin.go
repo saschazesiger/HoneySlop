@@ -112,7 +112,7 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		a.serveIndex(w, r)
 		return
 	}
-	if name, ok := strings.CutPrefix(p, "/pot/static/"); ok && (strings.HasSuffix(name, ".js") || strings.HasSuffix(name, ".css")) {
+	if name, ok := strings.CutPrefix(p, "/pot/static/"); ok && (strings.HasSuffix(name, ".js") || strings.HasSuffix(name, ".css") || strings.HasSuffix(name, ".woff2")) {
 		a.serveAsset(w, r, name)
 		return
 	}
@@ -170,7 +170,18 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		}
 		c := a.cfg.Get()
 		st.AIEnabled, st.AIReady = c.AIEnabled, c.AIEnabled && c.OpenRouterKey != ""
+		if ms, err := a.store.MilestoneCounts(); err == nil {
+			full := map[string]int{}
+			for _, k := range milestoneOrder {
+				full[k] = ms[k]
+			}
+			st.Milestones = full
+		}
 		writeJSON(w, 200, st)
+	case api == "world" && r.Method == http.MethodGet:
+		writeJSON(w, 200, a.worldView())
+	case api == "world/regenerate" && r.Method == http.MethodPost:
+		a.apiRegenerateWorld(w, r)
 	case api == "ips" && r.Method == http.MethodGet:
 		ips, err := a.store.ListIPs(r.URL.Query().Get("q"), 500)
 		if err != nil {
@@ -193,6 +204,7 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, 500, err.Error())
 			return
 		}
+		_ = a.cache.Clear()
 		a.hub.Publish("cleared", map[string]any{})
 		writeJSON(w, 200, map[string]bool{"ok": true})
 	case api == "stream" && r.Method == http.MethodGet:
@@ -227,11 +239,17 @@ func (a *App) serveAsset(w http.ResponseWriter, r *http.Request, name string) {
 		return
 	}
 	ct := mime.TypeByExtension(path.Ext(name))
+	cache := "no-cache"
+	if path.Ext(name) == ".woff2" {
+		// not in Go's builtin table and minimal images ship no /etc/mime.types;
+		// fonts never change in place (a new version gets a new file name), so cache them for long
+		ct, cache = "font/woff2", "public, max-age=2592000"
+	}
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Cache-Control", cache)
 	_, _ = w.Write(data)
 }
 
@@ -446,4 +464,43 @@ func (a *App) apiStream(w http.ResponseWriter, r *http.Request) {
 			fl.Flush()
 		}
 	}
+}
+
+// ---- world (attack surface overview for the operator) ----
+
+func (a *App) worldView() map[string]any {
+	w := a.world()
+	return map[string]any{
+		"created":  w.Created.Format(time.RFC3339),
+		"hostname": termHost,
+		"ip":       worldHostIP,
+		"secrets":  w.Secrets(),
+		"chain":    attackChain(),
+	}
+}
+
+func attackChain() []map[string]string {
+	return []map[string]string{
+		{"step": "creds", "detail": "Read a leaked secret file: GET /.env (or LFI /index.php?page=../../../var/www/connect/.env, php://filter base64), /blog/wp-config.php.bak, or cat the world-readable /opt/scripts/db-backup.sh in the web shell. Only the real values found here work."},
+		{"step": "db", "detail": "Use the found credentials against the database: mysql -h db-prod-01.internal.veltrona-group.com -u connect_app -p (password from .env), or log into /phpmyadmin. Random passwords are rejected; only the leaked one authenticates."},
+		{"step": "login", "detail": "Log into a web app with real credentials: the Laravel portal /login, WordPress /blog/wp-login.php (one weak editor/admin password is crackable), or phpMyAdmin."},
+		{"step": "user", "detail": "Lateral movement in the web shell: the backup script reuses the deploy password, so su deploy succeeds (deploy is in the docker group)."},
+		{"step": "root", "detail": "Privilege escalation: deploy is in the docker group, so a container mounting the host filesystem yields a root shell; or the reused credentials unlock further access."},
+	}
+}
+
+func (a *App) apiRegenerateWorld(w http.ResponseWriter, r *http.Request) {
+	nw, err := GenerateWorld()
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := nw.Save(a.dataDir); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	a.setWorld(nw)
+	_ = a.cache.Clear() // the new world serves different pages; old cached answers are stale
+	a.hub.Publish("world", a.worldView())
+	writeJSON(w, 200, a.worldView())
 }
