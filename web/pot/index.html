@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0b0d">
+<title>HoneySlop · pot</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a0b0d'/%3E%3Cpath d='M16 5.2l9.4 5.4v10.8L16 26.8l-9.4-5.4V10.6z' fill='none' stroke='%233ddc97' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='M16 12l3.6 2.1v4.1L16 20.3l-3.6-2.1v-4.1z' fill='%233ddc97'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/pot/static/app.css">
+<script src="/pot/static/app.js" defer></script>
+</head>
+<body>
+
+<div id="boot" class="boot" aria-busy="true">
+  <div class="boot-mark">
+    <svg viewBox="0 0 24 24" class="logo-glyph" aria-hidden="true"><path class="hex-o" d="M12 2.6l8.2 4.7v9.4L12 21.4l-8.2-4.7V7.3z"/><path class="hex-i" d="M12 9.2l2.6 1.5v3l-2.6 1.5-2.6-1.5v-3z"/></svg>
+  </div>
+</div>
+
+<!-- ============ Auth (setup / login) ============ -->
+<section id="auth" class="auth" hidden>
+  <form id="auth-form" class="auth-card" novalidate>
+    <div class="auth-brand">
+      <svg viewBox="0 0 24 24" class="logo-glyph" aria-hidden="true"><path class="hex-o" d="M12 2.6l8.2 4.7v9.4L12 21.4l-8.2-4.7V7.3z"/><path class="hex-i" d="M12 9.2l2.6 1.5v3l-2.6 1.5-2.6-1.5v-3z"/></svg>
+      <span class="wordmark">HoneySlop</span><span class="brand-sub">/pot</span>
+    </div>
+    <h1 id="auth-title">Sign in</h1>
+    <p id="auth-sub" class="auth-sub">Enter the admin password to watch the honeypot.</p>
+    <label class="field">
+      <span class="field-label">Password</span>
+      <input type="password" id="auth-pass" autocomplete="current-password" spellcheck="false">
+    </label>
+    <label class="field" id="auth-confirm-wrap" hidden>
+      <span class="field-label">Confirm password</span>
+      <input type="password" id="auth-confirm" autocomplete="new-password" spellcheck="false">
+    </label>
+    <div id="auth-error" class="form-msg err" role="alert" hidden></div>
+    <button class="btn btn-primary btn-block" type="submit" id="auth-submit">Sign in</button>
+    <div class="auth-foot"><span class="mono" id="auth-version"></span></div>
+  </form>
+</section>
+
+<!-- ============ Dashboard ============ -->
+<div id="app" class="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" class="logo-glyph" aria-hidden="true"><path class="hex-o" d="M12 2.6l8.2 4.7v9.4L12 21.4l-8.2-4.7V7.3z"/><path class="hex-i" d="M12 9.2l2.6 1.5v3l-2.6 1.5-2.6-1.5v-3z"/></svg>
+      <span class="wordmark">HoneySlop</span><span class="brand-sub">/pot</span>
+    </div>
+    <div class="live" id="live" data-state="connecting" title="Event stream">
+      <span class="live-dot"></span><span id="live-label">Connecting</span>
+    </div>
+    <div class="stats" id="stats">
+      <div class="chip" title="Events in the last 24 hours"><span class="chip-v" id="st-events24">–</span><span class="chip-l">events 24h</span></div>
+      <div class="chip" title="Distinct attacker IPs in the last 24 hours"><span class="chip-v" id="st-ips24">–</span><span class="chip-l">IPs 24h</span></div>
+      <div class="chip" title="LLM generated responses in the last 24 hours"><span class="chip-v" id="st-ai24">–</span><span class="chip-l">AI calls 24h</span></div>
+      <div class="chip chip-opt" title="Fake-terminal commands in the last 24 hours"><span class="chip-v" id="st-term24">–</span><span class="chip-l">shell cmds 24h</span></div>
+      <div class="chip chip-opt chip-muted" title="All-time totals"><span class="chip-v" id="st-total">–</span><span class="chip-l">events total</span></div>
+    </div>
+    <div class="top-actions">
+      <div class="ai-toggle" id="ai-toggle" data-state="off">
+        <span class="ai-label">AI</span>
+        <button type="button" class="switch" id="ai-switch" role="switch" aria-checked="false" aria-label="Toggle AI responses"><span class="knob"></span></button>
+        <button type="button" class="ai-state" id="ai-state" tabindex="-1">Off</button>
+      </div>
+      <span class="divider"></span>
+      <button type="button" class="btn btn-ghost btn-sm" id="btn-settings" title="Settings"><span class="ico" data-icon="sliders"></span><span class="btn-text">Settings</span></button>
+      <button type="button" class="btn btn-ghost btn-sm btn-danger-ghost" id="btn-clear" title="Delete all events and IPs"><span class="ico" data-icon="trash"></span><span class="btn-text">Clear all</span></button>
+      <button type="button" class="btn btn-ghost btn-sm btn-icon" id="btn-logout" title="Log out" aria-label="Log out"><span class="ico" data-icon="logout"></span></button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="search">
+        <span class="ico" data-icon="search"></span>
+        <input type="search" id="search" placeholder="Filter IP, country, city, org…" autocomplete="off" spellcheck="false" aria-label="Filter attackers">
+        <kbd>/</kbd>
+      </div>
+      <div class="list-head">
+        <span id="ip-count">0 attackers</span>
+        <span class="list-head-r">↑↓ to navigate</span>
+      </div>
+      <div class="list-empty" id="list-empty" hidden>
+        <div class="list-empty-t" id="list-empty-t">No attackers yet</div>
+        <div class="list-empty-s" id="list-empty-s">They usually show up within minutes.</div>
+      </div>
+      <div class="ip-list" id="ip-list" role="listbox" aria-label="Attacker IPs"></div>
+    </aside>
+
+    <section class="detail" id="detail">
+      <!-- nobody yet -->
+      <div class="empty" id="empty-none" hidden>
+        <div class="radar" aria-hidden="true"><span></span><span></span><span></span><i></i></div>
+        <h2>Waiting for the first visitor…</h2>
+        <p>The pot is open. Scanners usually find a fresh host within minutes. Poke it yourself to see it work:</p>
+        <div class="cmd-hint"><code id="curl-hint">curl http://localhost/.env</code><button type="button" class="btn btn-ghost btn-xs" id="copy-curl" title="Copy"><span class="ico" data-icon="copy"></span></button></div>
+      </div>
+      <!-- nothing selected -->
+      <div class="empty" id="empty-select" hidden>
+        <div class="empty-glyph" aria-hidden="true"><span class="ico" data-icon="crosshair"></span></div>
+        <h2>Select an attacker</h2>
+        <p>Pick an IP on the left to replay everything it sent and everything the pot answered.</p>
+        <div class="kbd-hints"><span><kbd>/</kbd> search</span><span><kbd>↑</kbd><kbd>↓</kbd> navigate</span><span><kbd>Esc</kbd> close</span></div>
+      </div>
+      <!-- selected ip -->
+      <div class="detail-body" id="detail-body" hidden>
+        <div class="ip-header" id="ip-header"></div>
+        <div class="tl-head">
+          <span class="section-label">Timeline</span>
+          <span class="tl-count" id="tl-count"></span>
+          <span class="tl-hint">newest first · click an event to inspect</span>
+        </div>
+        <ol class="timeline" id="timeline"></ol>
+        <div class="tl-foot" id="tl-foot">
+          <button type="button" class="btn btn-ghost btn-sm" id="load-older" hidden>Load older events</button>
+          <span class="tl-end" id="tl-end" hidden>Beginning of history</span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ============ Settings modal ============ -->
+<div class="modal-wrap" id="settings-modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-head">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" class="btn btn-ghost btn-icon btn-sm" data-close aria-label="Close"><span class="ico" data-icon="x"></span></button>
+    </div>
+    <form class="modal-body" id="settings-form" novalidate autocomplete="off">
+      <section class="set-section">
+        <div class="set-title">
+          <h3>OpenRouter</h3>
+          <p>The LLM that fabricates every response. Without a key the pot serves bland fallback pages.</p>
+        </div>
+        <label class="field">
+          <span class="field-label">API key</span>
+          <div class="input-row">
+            <input type="password" id="set-key" placeholder="sk-or-v1-…" autocomplete="new-password" spellcheck="false">
+            <button type="button" class="btn btn-ghost btn-sm" id="set-key-clear">Clear key</button>
+          </div>
+          <span class="field-help" id="set-key-hint">No key configured.</span>
+        </label>
+        <label class="field">
+          <span class="field-label">Model</span>
+          <input type="text" id="set-model" list="model-list" spellcheck="false" placeholder="vendor/model">
+          <datalist id="model-list"></datalist>
+          <span class="field-help">Any OpenRouter model slug. Fast &amp; cheap models work best — attackers expect quick responses.</span>
+        </label>
+        <div class="test-row">
+          <button type="button" class="btn btn-sm" id="set-test"><span class="ico" data-icon="bolt"></span>Test connection</button>
+          <span class="test-result" id="set-test-result"></span>
+        </div>
+      </section>
+
+      <section class="set-section">
+        <div class="set-title">
+          <h3>Persona</h3>
+          <p>The fictional company this server pretends to belong to. The LLM uses it to invent consistent hostnames, employees, customers, internal tools, credentials and file contents across all responses. The more specific, the more believable.</p>
+        </div>
+        <label class="field">
+          <span class="field-label">Company profile</span>
+          <textarea id="set-persona" rows="10" spellcheck="false"></textarea>
+        </label>
+      </section>
+
+      <section class="set-section">
+        <div class="set-title">
+          <h3>Rate limits</h3>
+          <p>LLM calls per attacker IP. Above the limit the pot keeps answering with fallback responses (source <span class="src src-ratelimited">ratelimited</span>) so your OpenRouter bill stays bounded.</p>
+        </div>
+        <div class="limits">
+          <div class="limit"><span class="limit-v" id="lim-minute">–</span><span class="limit-l">per minute</span></div>
+          <div class="limit"><span class="limit-v" id="lim-hour">–</span><span class="limit-l">per hour</span></div>
+          <div class="limit"><span class="limit-v" id="lim-day">–</span><span class="limit-l">per day</span></div>
+          <div class="limit limit-wide"><span class="limit-v mono" id="lim-domain">–</span><span class="limit-l">honeypot domain</span></div>
+        </div>
+      </section>
+
+      <section class="set-section">
+        <div class="set-title">
+          <h3>Admin password</h3>
+          <p>Changing it signs out every other session.</p>
+        </div>
+        <div class="grid-2">
+          <label class="field">
+            <span class="field-label">Current password</span>
+            <input type="password" id="pw-current" autocomplete="current-password">
+          </label>
+          <label class="field">
+            <span class="field-label">New password</span>
+            <input type="password" id="pw-new" autocomplete="new-password" placeholder="min. 8 characters">
+          </label>
+        </div>
+        <div class="test-row">
+          <button type="button" class="btn btn-sm" id="pw-save">Change password</button>
+          <span class="test-result" id="pw-result"></span>
+        </div>
+      </section>
+    </form>
+    <div class="modal-foot">
+      <span class="form-msg err" id="settings-error" hidden></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="button" class="btn btn-primary" id="settings-save">Save changes</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ Clear-all confirm modal ============ -->
+<div class="modal-wrap" id="clear-modal" hidden>
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal modal-sm" role="alertdialog" aria-modal="true" aria-labelledby="clear-title">
+    <div class="modal-head">
+      <h2 id="clear-title">Delete all data?</h2>
+      <button type="button" class="btn btn-ghost btn-icon btn-sm" data-close aria-label="Close"><span class="ico" data-icon="x"></span></button>
+    </div>
+    <div class="modal-body">
+      <p class="danger-text">This permanently deletes <strong id="clear-counts">all events and IPs</strong>. Settings and your password are kept. This cannot be undone.</p>
+      <label class="field">
+        <span class="field-label">Type <code>clear</code> to confirm</span>
+        <input type="text" id="clear-input" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="form-msg err" id="clear-error" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <span class="spacer"></span>
+      <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+      <button type="button" class="btn btn-danger" id="clear-confirm" disabled>Delete everything</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

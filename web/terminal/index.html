@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>www-data@web-prod-03: ~</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111316'/%3E%3Cpath d='M8 11l6 5-6 5' stroke='%2334d399' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M16 22h8' stroke='%23e5e7eb' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0b0c0e; --bar: #111316; --line: #1d2025; --fg: #d4d7dc; --dim: #6b7280;
+    --green: #34d399; --blue: #60a5fa; --red: #f87171; --yellow: #fbbf24;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+  body { display: flex; flex-direction: column; font: 14px/1.5 var(--mono); -webkit-font-smoothing: antialiased; }
+  header {
+    flex: none; display: flex; align-items: center; gap: 10px; height: 38px; padding: 0 14px;
+    background: var(--bar); border-bottom: 1px solid var(--line); color: var(--dim); font-size: 12px; user-select: none;
+  }
+  header .dots { display: flex; gap: 7px; }
+  header .dots i { width: 11px; height: 11px; border-radius: 50%; background: #2a2e35; display: block; }
+  header .title { flex: 1; text-align: center; letter-spacing: .02em; }
+  header .state { display: flex; align-items: center; gap: 6px; }
+  header .state b { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(52,211,153,.12); }
+  #term { flex: 1; overflow-y: auto; padding: 16px 18px 40px; cursor: text; white-space: pre-wrap; word-break: break-word; }
+  #term::-webkit-scrollbar { width: 8px; } #term::-webkit-scrollbar-thumb { background: #22262c; border-radius: 8px; }
+  .motd { color: #a3a8b0; }
+  .u { color: var(--green); font-weight: 600; } .p { color: var(--blue); font-weight: 600; }
+  .out { color: var(--fg); }
+  .err { color: var(--red); }
+  .cursor { display: inline-block; min-width: .6em; background: var(--fg); color: var(--bg); animation: blink 1.1s steps(1) infinite; }
+  .cursor.idle { animation: none; background: transparent; outline: 1px solid var(--dim); color: var(--fg); }
+  @keyframes blink { 50% { background: transparent; color: var(--fg); } }
+  #in { position: fixed; left: -1000px; top: 0; width: 1px; height: 1px; opacity: 0; }
+  ::selection { background: rgba(96,165,250,.3); }
+  @media (max-width: 640px) { body { font-size: 12.5px; } #term { padding: 12px; } header .dots { display: none; } }
+</style>
+</head>
+<body>
+<header><span class="dots"><i></i><i></i><i></i></span><span class="title" id="title">www-data@web-prod-03: ~</span><span class="state"><b></b>ssh</span></header>
+<div id="term" aria-live="polite"></div>
+<textarea id="in" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="terminal input"></textarea>
+<script id="boot" type="application/json">{{BOOT}}</script>
+<script>
+(() => {
+  const boot = JSON.parse(document.getElementById('boot').textContent);
+  const term = document.getElementById('term'), inp = document.getElementById('in'), title = document.getElementById('title');
+  let cwd = boot.cwd, user = boot.user, busy = false, hist = [], hpos = 0, live = null;
+  const ESC = new RegExp('\\u001b\\[[0-9;?]*[A-Za-z]|\\u001b\\][^\\u0007]*\\u0007', 'g');
+
+  const home = u => u === 'root' ? '/root' : u === 'www-data' ? '/var/www' : '/home/' + u;
+  const short = (p, u) => { const h = home(u); return p === h ? '~' : p.startsWith(h + '/') ? '~' + p.slice(h.length) : p; };
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+  function promptNode(u, p) {
+    const s = el('span');
+    s.append(el('span', 'u', `${u}@${boot.host}`), ':', el('span', 'p', short(p, u)), u === 'root' ? '# ' : '$ ');
+    return s;
+  }
+  function print(text, cls) {
+    if (text === '' || text == null) return;
+    const d = el('div', cls || 'out', String(text).replace(ESC, ''));
+    term.insertBefore(d, live);
+  }
+  function echoCommand(u, p, cmd) {
+    const d = el('div');
+    d.append(promptNode(u, p), document.createTextNode(cmd));
+    term.insertBefore(d, live);
+  }
+  function renderLive() {
+    live.replaceChildren();
+    if (busy) { live.append(el('span', 'cursor idle', ' ')); return; }
+    const v = inp.value, pos = inp.selectionStart ?? v.length;
+    live.append(promptNode(user, cwd), document.createTextNode(v.slice(0, pos)),
+      el('span', 'cursor', v[pos] && v[pos] !== '\n' ? v[pos] : ' '), document.createTextNode(v.slice(pos + 1)));
+    title.textContent = `${user}@${boot.host}: ${short(cwd, user)}`;
+    term.scrollTop = term.scrollHeight;
+  }
+
+  async function run(cmd) {
+    echoCommand(user, cwd, cmd);
+    if (cmd.trim()) { hist.push(cmd); }
+    hpos = hist.length;
+    const t = cmd.trim();
+    if (t === 'clear' || t === 'reset') { [...term.children].forEach(c => c !== live && c.remove()); return; }
+    if (!t) return;
+    busy = true; renderLive();
+    try {
+      const r = await fetch('/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmd }) });
+      const j = await r.json();
+      print(j.output);
+      if (j.cwd) cwd = j.cwd;
+      if (j.user) user = j.user;
+      if (t === 'exit' || t === 'logout') { print('Connection to ' + boot.host + ' closed.', 'motd'); }
+    } catch (e) {
+      print('-bash: fork: retry: Resource temporarily unavailable', 'err');
+    }
+    busy = false; renderLive();
+  }
+
+  // initial screen: motd + restored session
+  live = el('div'); term.append(live);
+  print(boot.motd, 'motd'); print(' ');
+  for (const h of boot.history || []) { echoCommand(h.user, h.cwd, h.cmd); print(h.output); if (h.cmd) hist.push(h.cmd); }
+  hpos = hist.length;
+  renderLive();
+
+  inp.addEventListener('keydown', e => {
+    if (busy) { if (!(e.ctrlKey || e.metaKey)) e.preventDefault(); return; }
+    if (e.key === 'Enter') { e.preventDefault(); const c = inp.value; inp.value = ''; run(c).then(renderLive); renderLive(); return; }
+    if (e.key === 'Tab') { e.preventDefault(); return; }
+    if (e.ctrlKey && e.key.toLowerCase() === 'c' && !window.getSelection().toString()) {
+      e.preventDefault(); echoCommand(user, cwd, inp.value + '^C'); inp.value = ''; renderLive(); return;
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === 'l') { e.preventDefault(); [...term.children].forEach(c => c !== live && c.remove()); renderLive(); return; }
+    if (e.ctrlKey && e.key.toLowerCase() === 'u') { e.preventDefault(); inp.value = ''; renderLive(); return; }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      hpos = Math.max(0, Math.min(hist.length, hpos + (e.key === 'ArrowUp' ? -1 : 1)));
+      inp.value = hist[hpos] ?? '';
+      inp.setSelectionRange(inp.value.length, inp.value.length);
+      renderLive(); return;
+    }
+    requestAnimationFrame(renderLive);
+  });
+  inp.addEventListener('input', () => { inp.value = inp.value.replace(/\r?\n/g, ' '); renderLive(); });
+  document.addEventListener('selectionchange', () => document.activeElement === inp && renderLive());
+  term.addEventListener('mouseup', () => { if (!window.getSelection().toString()) inp.focus({ preventScroll: true }); });
+  window.addEventListener('focus', () => inp.focus({ preventScroll: true }));
+  inp.focus();
+})();
+</script>
+</body>
+</html>

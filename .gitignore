@@ -1,0 +1,5 @@
+/data/
+/honeyslop
+*.db
+*.db-wal
+*.db-shm
