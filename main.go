@@ -72,7 +72,7 @@ func main() {
 	httpAddr := flag.String("http", env("HTTP_ADDR", ":80"), "HTTP listen address")
 	httpsAddr := flag.String("https", env("HTTPS_ADDR", ":443"), "HTTPS listen address")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "HoneySlop %s — AI powered honeypot\n\nusage: honeyslop [flags] [domain]\n\n", version)
+		fmt.Fprintf(os.Stderr, "HoneySlop %s, AI powered honeypot\n\nusage: honeyslop [flags] [domain]\n\n", version)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -184,7 +184,7 @@ func main() {
 	log.Printf("   honeypot  → http://%s  https://%s  (http %s, https %s)", host, host, *httpAddr, *httpsAddr)
 	log.Printf("   dashboard → https://%s/pot", host)
 	if cfg.Get().PasswordHash == "" {
-		log.Printf("   ⚠ no admin password yet — open /pot now to create one")
+		log.Printf("   ⚠ no admin password yet, open /pot now to create one")
 	}
 	if domain == "" {
 		log.Printf("   no domain given: serving a self-signed certificate (pass a domain to get Let's Encrypt)")
